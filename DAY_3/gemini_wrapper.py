@@ -9,7 +9,7 @@ Author: GDG Workshop Team
 License: MIT
 """
 
-import google.generativeai as genai
+import google.genai as genai
 from typing import Optional, List, Dict
 import os
 from dotenv import load_dotenv
@@ -33,6 +33,7 @@ class GeminiWrapper:
     def __init__(
         self,
         api_key: Optional[str] = None,
+        model_name: str = "gemini-2.5-flash",
         temperature: float = 0.7,
         verbose: bool = True
     ):
@@ -47,7 +48,6 @@ class GeminiWrapper:
 
         Raises:
             ValueError: If no API key is provided or found in environment
-
         """
         # Get API key
         self.api_key = api_key or os.getenv('GEMINI_API_KEY')
@@ -58,20 +58,21 @@ class GeminiWrapper:
                 "Get your key at: https://makersuite.google.com/app/apikey"
             )
 
-        # Configure Gemini
-        genai.configure(api_key=self.api_key)
+        # Configure Gemini client (google.genai)
+        # google.genai uses a Client; there is no global configure()
+        self.client = genai.Client(api_key=self.api_key)
 
         # Store configuration
+        self.model_name = model_name
         self.temperature = temperature
         self.verbose = verbose
-
 
         # Initialize tracking
         self.history = []
         self.persona = None
 
         if self.verbose:
-            print(f"✅ Gemini initialized, (temp={temperature})")
+            print(f"✅ Gemini initialized: {model_name} (temp={temperature})")
 
     def set_persona(self, persona_description: str) -> None:
         """
@@ -84,7 +85,6 @@ class GeminiWrapper:
 
         Args:
             persona_description: Description of the AI's role and behavior
-
         """
         self.persona = persona_description
         if self.verbose:
@@ -112,43 +112,44 @@ class GeminiWrapper:
             Exception: If API call fails (returns error message as string)
         """
         # Build full prompt with persona if set
-        full_prompt = ""
-        if self.persona:
-            full_prompt = f"SYSTEM: {self.persona}\n\nUSER: {prompt}"
-        else:
-            full_prompt = prompt
-
-        # Use provided temperature or default
+        full_prompt = f"SYSTEM: {self.persona}\n\nUSER: {prompt}" if self.persona else prompt
         temp = temperature if temperature is not None else self.temperature
 
         try:
-            # Configure generation
-            config = genai.types.GenerationConfig(
-                temperature=temp,
-                max_output_tokens=max_tokens,
-                top_p=0.95,
-                top_k=40
-            )
-
-            # Generate response
-            response = self.model.generate_content(
-                full_prompt,
-                generation_config=config
+            # google.genai generation call (use generate_content)
+            resp = self.client.models.generate_content(
+                model=self.model_name,
+                contents=full_prompt,
+                config={
+                    "temperature": temp,
+                    "max_output_tokens": max_tokens,
+                    "top_p": 0.95,
+                    "top_k": 40,
+                },
             )
 
             # Extract text
-            response_text = response.text
+            text = ""
+            if hasattr(resp, "text") and isinstance(resp.text, str):
+                text = resp.text
+            elif hasattr(resp, "candidates") and resp.candidates:
+                for cand in resp.candidates:
+                    if getattr(cand, "content", None):
+                        parts = getattr(cand.content, "parts", [])
+                        for p in parts:
+                            if getattr(p, "text", None):
+                                text += p.text
+                text = text.strip()
 
             # Track in history
             self.history.append({
                 'prompt': prompt,
-                'response': response_text,
+                'response': text,
                 'temperature': temp,
                 'model': self.model_name
             })
 
-            return response_text
-
+            return text or ""
         except Exception as e:
             error_msg = f"Error calling Gemini API: {str(e)}"
             if self.verbose:
@@ -157,26 +158,26 @@ class GeminiWrapper:
 
     def chat(self, message: str) -> str:
         """
-        Send a message in a multi-turn conversation.
-
-        Unlike generate(), this maintains conversation context across multiple
-        calls, allowing the AI to reference previous messages.
-
-        Args:
-            message: User message in the conversation
-
-        Returns:
-            AI's response
+        Simple chat using a running transcript.
         """
-        # Create chat session on first use
-        if not hasattr(self, 'chat_session'):
-            self.chat_session = self.model.start_chat(history=[])
+        # Maintain a naive chat transcript for context
+        if not hasattr(self, '_chat_transcript'):
+            self._chat_transcript = []
 
-        try:
-            response = self.chat_session.send_message(message)
-            return response.text
-        except Exception as e:
-            return f"Chat error: {str(e)}"
+        self._chat_transcript.append({"role": "user", "text": message})
+        # Build a chat-style prompt
+        convo = []
+        if self.persona:
+            convo.append(f"SYSTEM: {self.persona}")
+        for turn in self._chat_transcript[-10:]:  # last 10 turns
+            prefix = "USER" if turn["role"] == "user" else "ASSISTANT"
+            convo.append(f"{prefix}: {turn['text']}")
+        convo.append("ASSISTANT:")
+        prompt = "\n\n".join(convo)
+
+        reply = self.generate(prompt)
+        self._chat_transcript.append({"role": "assistant", "text": reply})
+        return reply
 
     def clear_history(self) -> None:
         """
@@ -185,8 +186,8 @@ class GeminiWrapper:
         Useful when starting a new conversation topic.
         """
         self.history = []
-        if hasattr(self, 'chat_session'):
-            delattr(self, 'chat_session')
+        if hasattr(self, '_chat_transcript'):
+            self._chat_transcript = []
         if self.verbose:
             print("✅ History cleared")
 
@@ -255,17 +256,6 @@ def demo():
         print("User: What's my favorite color?")
         r2 = llm.chat("What's my favorite color?")
         print(f"AI: {r2}\n")
-
-        # Stats
-        print("4. Statistics")
-        print("-" * 70)
-        stats = llm.get_stats()
-        for key, value in stats.items():
-            print(f"{key}: {value}")
-
-        print("\n" + "="*70)
-        print("✅ Demo completed successfully!")
-        print("="*70 + "\n")
 
     except ValueError as e:
         print(f"\n❌ Error: {e}\n")
